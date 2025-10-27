@@ -14,8 +14,9 @@ let mandalaProgress = 0;
 const rings = 6;
 
 // === NEW CONFIG ===
-const BACKEND_URL = "https://some-name.ngrok-free.app/api/chat";
+const BACKEND_URL = "https://shanta-unreared.ngrok-free.app/api/chat";
 const API_KEY = "ULTRON_TEST_KEY_123";
+
 
 
 // Chat elements
