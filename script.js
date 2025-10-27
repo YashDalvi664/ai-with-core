@@ -1,4 +1,4 @@
-/* updated script.js - mandala thinking reliably visible + backend call */
+/* Ultron Frontend – AI Mandala + Chat Backend Integration */
 
 const canvas = document.getElementById('aiBall');
 const ctx = canvas.getContext('2d');
@@ -13,7 +13,7 @@ let mandalaRotation = 0;
 let mandalaProgress = 0;
 const rings = 6;
 
-// === NEW CONFIG ===
+// === CONFIG ===
 const BACKEND_URL = "https://ultron-ai-backend.onrender.com/api/chat";
 const API_KEY = "ULTRON_TEST_KEY_123";
 
@@ -90,20 +90,18 @@ canvas.addEventListener('mouseleave', () => {
   mouse.y = -9999;
 });
 
-// Thinking / mandala helpers
+// Thinking animation
 let thinkingStartedAt = 0;
-const MIN_THINK_MS = 1200; // minimum visible thinking time
-const MANDALA_RAMP_FAST = 0.04; // ramp speed while thinking (bigger = faster)
-const MANDALA_RAMP_SLOW = 0.01; // ramp speed while stopping
+const MIN_THINK_MS = 1200;
+const MANDALA_RAMP_FAST = 0.04;
+const MANDALA_RAMP_SLOW = 0.01;
 
 function startThinking() {
   aiThinking = true;
   thinkingStartedAt = performance.now();
-  // make mandala progress increase faster immediately for visible effect
 }
 
 function stopThinking() {
-  // ensure minimum visible thinking time
   const elapsed = performance.now() - thinkingStartedAt;
   const remain = Math.max(0, MIN_THINK_MS - elapsed);
   setTimeout(() => {
@@ -111,11 +109,11 @@ function stopThinking() {
   }, remain);
 }
 
-// Animate particles
+// Animation loop
 function animate(time) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  // AI area subtle background circle
+  // Background
   ctx.beginPath();
   ctx.arc(cx, cy, bigRadius + 20, 0, 2 * Math.PI);
   const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, bigRadius + 60);
@@ -124,12 +122,12 @@ function animate(time) {
   ctx.fillStyle = gradient;
   ctx.fill();
 
-  // Mandala animation progress with faster ramp when thinking
+  // Mandala logic
   if (aiThinking && mandalaProgress < 1) mandalaProgress = Math.min(1, mandalaProgress + MANDALA_RAMP_FAST);
   else if (!aiThinking && mandalaProgress > 0) mandalaProgress = Math.max(0, mandalaProgress - MANDALA_RAMP_SLOW);
 
   const easedProgress = easeInOut(Math.max(0, Math.min(1, mandalaProgress)));
-  if (aiThinking) mandalaRotation += 0.012 * (1 + easedProgress); // faster rotation while thinking
+  if (aiThinking) mandalaRotation += 0.012 * (1 + easedProgress);
 
   for (let p of particles) {
     p.scatterAngle += p.speed;
@@ -167,11 +165,10 @@ function animate(time) {
     ctx.fill();
   }
 
-  // Neural lines (visible when mandala appears)
+  // Neural connections
   if (mandalaProgress > 0.05) {
     ctx.strokeStyle = "rgba(0,0,0,0.05)";
     ctx.lineWidth = 0.3;
-    // sample connections to reduce cost
     for (let i = 0; i < particles.length; i += 12) {
       for (let j = i + 1; j < particles.length; j += 12) {
         const dx = particles[i].x - particles[j].x;
@@ -196,40 +193,34 @@ async function sendToBackend(msg) {
     const res = await fetch(BACKEND_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: msg, apiKey: API_KEY })
+      body: JSON.stringify({ message: msg, api_key: API_KEY }) // ✅ fixed key
     });
+
     if (!res.ok) {
-      // try to parse error body
-      let errBody = "";
-      try { errBody = await res.text(); } catch (_) {}
+      const errBody = await res.text();
       console.error("Server error:", res.status, errBody);
       return `Ultron: (backend error ${res.status})`;
     }
+
     const data = await res.json();
-    // some dummy backends return { reply } or { text } — normalize both
-    return data.reply || data.text || "Ultron: (no response)";
+    return data.reply || "Ultron: (no response)";
   } catch (e) {
     console.error("Backend fetch failed:", e);
     return "Ultron: Unable to reach backend.";
   }
 }
 
+// Chat input handling
 chatInput.addEventListener("keypress", e => {
   if (e.key === "Enter" && chatInput.value.trim() !== "") {
     const msg = chatInput.value.trim();
     addMessage("user", msg);
     chatInput.value = "";
 
-    // Start thinking visually
     startThinking();
 
-    // Call backend but do not block main thread — handle reply in .then()
-    // This ensures the render loop keeps running immediately.
     sendToBackend(msg).then(reply => {
-      // Guarantee min thinking time before stopping
       stopThinking();
-      // When stopThinking sets aiThinking false after MIN_THINK_MS, we still
-      // want to add the AI message immediately upon receiving reply so chat doesn't feel slow.
       addMessage("ai", reply);
     }).catch(err => {
       stopThinking();
