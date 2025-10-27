@@ -14,8 +14,9 @@ let mandalaProgress = 0;
 const rings = 6;
 
 // === NEW CONFIG ===
-const BACKEND_URL = "https://ultron-ai-backend.onrender.com/api/chat";
+const BACKEND_URL = "https://ab3c-122-162-22-91.ngrok.io/api/chat";
 const API_KEY = "ULTRON_TEST_KEY_123";
+
 
 // Chat elements
 const chatMessages = document.getElementById("chatMessages");
