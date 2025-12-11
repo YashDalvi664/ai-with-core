@@ -1,6 +1,6 @@
 /* updated script.js - mandala thinking reliably visible + backend call
    Connectivity patch: dynamic backend/key via query/localStorage + settings UI.
-   sendToBackend attempts protocol fallback and outputs helpful troubleshooting text.
+   sendToBackend attempts protocol fallback and outputs helpful diagnostics.
 */
 
 const canvas = document.getElementById('aiBall');
