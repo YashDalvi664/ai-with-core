@@ -1,7 +1,6 @@
 /* updated script.js - mandala thinking reliably visible + backend call
-   Connectivity patch: query/localStorage backend + API key, resume link handling.
-   Adds a small settings UI (gear) so you can set backend & api key from the page.
-   (Everything else unchanged.)
+   Connectivity patch: dynamic backend/key via query/localStorage + settings UI.
+   sendToBackend attempts protocol fallback and outputs helpful troubleshooting text.
 */
 
 const canvas = document.getElementById('aiBall');
@@ -18,11 +17,9 @@ let mandalaProgress = 0;
 const rings = 6;
 
 // === CONNECTIVITY CONFIG (now dynamic) ===
-// Default (kept for backwards compatibility). You can override via:
-// 1) URL query: ?backend=<BACKEND_URL>&apikey=<API_KEY>
-// 2) localStorage keys: ULTRON_BACKEND and ULTRON_API_KEY
-let DEFAULT_BACKEND_URL = "https://shanta-unreared-richie.ngrok-free.dev/api/chat";
-let DEFAULT_API_KEY = "ULTRON_TEST_KEY_123";
+// Default - replace or override via query params or settings UI
+let DEFAULT_BACKEND_URL = "http://localhost:5001/api/chat";
+let DEFAULT_API_KEY = "ULTRON_CLIENT_KEY_ABC";
 
 // helper: read query params
 function getQueryParams() {
@@ -132,11 +129,9 @@ const MANDALA_RAMP_SLOW = 0.01; // ramp speed while stopping
 function startThinking() {
   aiThinking = true;
   thinkingStartedAt = performance.now();
-  // make mandala progress increase faster immediately for visible effect
 }
 
 function stopThinking() {
-  // ensure minimum visible thinking time
   const elapsed = performance.now() - thinkingStartedAt;
   const remain = Math.max(0, MIN_THINK_MS - elapsed);
   setTimeout(() => {
@@ -157,12 +152,12 @@ function animate(time) {
   ctx.fillStyle = gradient;
   ctx.fill();
 
-  // Mandala animation progress with faster ramp when thinking
+  // Mandala progress & rotation
   if (aiThinking && mandalaProgress < 1) mandalaProgress = Math.min(1, mandalaProgress + MANDALA_RAMP_FAST);
   else if (!aiThinking && mandalaProgress > 0) mandalaProgress = Math.max(0, mandalaProgress - MANDALA_RAMP_SLOW);
 
   const easedProgress = easeInOut(Math.max(0, Math.min(1, mandalaProgress)));
-  if (aiThinking) mandalaRotation += 0.012 * (1 + easedProgress); // faster rotation while thinking
+  if (aiThinking) mandalaRotation += 0.012 * (1 + easedProgress);
 
   for (let p of particles) {
     p.scatterAngle += p.speed;
@@ -200,11 +195,10 @@ function animate(time) {
     ctx.fill();
   }
 
-  // Neural lines (visible when mandala appears)
+  // Neural lines
   if (mandalaProgress > 0.05) {
     ctx.strokeStyle = "rgba(0,0,0,0.05)";
     ctx.lineWidth = 0.3;
-    // sample connections to reduce cost
     for (let i = 0; i < particles.length; i += 12) {
       for (let j = i + 1; j < particles.length; j += 12) {
         const dx = particles[i].x - particles[j].x;
@@ -224,37 +218,79 @@ function animate(time) {
 }
 
 // === CHAT / BACKEND ===
+// Robust sendToBackend with fallback & diagnostics
 async function sendToBackend(msg) {
-  try {
-    const res = await fetch(BACKEND_URL, {
+  async function postTo(url) {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: msg, apiKey: API_KEY, clientId: navigator.userAgent })
     });
     if (!res.ok) {
-      // try to parse error body
-      let errBody = "";
-      try { errBody = await res.text(); } catch (_) {}
-      console.error("Server error:", res.status, errBody);
-      return { reply: `Ultron: (backend error ${res.status})` };
+      let text = "";
+      try { text = await res.text(); } catch (_) {}
+      let body = null;
+      try { body = JSON.parse(text || "{}"); } catch (_) {}
+      const errMsg = body && body.error ? body.error : (text || `status ${res.status}`);
+      const e = new Error(`Server error: ${errMsg}`);
+      e.status = res.status;
+      e.body = text;
+      throw e;
     }
-    const data = await res.json();
-    // data may be { reply } or { text } and may include resume_url
+    return res.json();
+  }
+
+  // Try configured URL
+  try {
+    const data = await postTo(BACKEND_URL);
     const replyText = data.reply || data.text || "Ultron: (no response)";
-    // normalize resume url: if backend returns "resume_url" relative, convert to absolute
     let resumeFullUrl = null;
     if (data.resume_url) {
-      try {
-        // if resume_url is absolute, new URL will parse it. If relative, base it on backend origin.
-        resumeFullUrl = new URL(data.resume_url, BACKEND_ORIGIN).toString();
-      } catch (e) {
-        resumeFullUrl = data.resume_url;
-      }
+      try { resumeFullUrl = new URL(data.resume_url, BACKEND_ORIGIN).toString(); } catch (e) { resumeFullUrl = data.resume_url; }
     }
     return { reply: replyText, resume_url: resumeFullUrl };
-  } catch (e) {
-    console.error("Backend fetch failed:", e);
-    return { reply: "Ultron: Unable to reach backend." };
+  } catch (err) {
+    console.warn("Primary backend request failed:", err);
+
+    try {
+      const pageIsHttps = window.location.protocol === "https:";
+      const backendIsHttp = BACKEND_URL.startsWith("http://");
+      if (pageIsHttps && backendIsHttp) {
+        const httpsUrl = BACKEND_URL.replace(/^http:\/\//i, "https://");
+        try {
+          const data = await postTo(httpsUrl);
+          BACKEND_URL = httpsUrl;
+          localStorage.setItem('ULTRON_BACKEND', BACKEND_URL);
+          BACKEND_ORIGIN = backendOriginFrom(BACKEND_URL);
+          const replyText = data.reply || data.text || "Ultron: (no response)";
+          let resumeFullUrl = null;
+          if (data.resume_url) {
+            try { resumeFullUrl = new URL(data.resume_url, BACKEND_ORIGIN).toString(); } catch (e) { resumeFullUrl = data.resume_url; }
+          }
+          return { reply: replyText, resume_url: resumeFullUrl };
+        } catch (err2) {
+          console.warn("HTTPS fallback failed:", err2);
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    let help = "Ultron: Unable to reach backend.";
+    if (window.location.protocol === "https:" && BACKEND_URL.startsWith("http://")) {
+      help += " (Blocked by browser: page is HTTPS but backend URL is HTTP — mixed-content.)";
+      help += " Tip: set backend to an HTTPS URL for your laptop (e.g. https://192.168.0.105:5001/api/chat) and ensure the laptop TLS cert is trusted.";
+    } else if (err && (err.message && (err.message.includes("NetworkError") || err.message.includes("Failed to fetch")))) {
+      help += " (Network error — backend unreachable).";
+      help += " Tip: Verify server is running and address/port are correct. Try terminal: curl -v " + (BACKEND_URL.replace('/api/chat','/health'));
+    } else if (err && err.message && err.message.toLowerCase().includes("server error")) {
+      help += " (" + err.message + ")";
+    } else {
+      help += " (See console for details.)";
+    }
+
+    help += " To trust a local TLS cert visit the backend health URL in this browser: " + (BACKEND_URL.replace('/api/chat','/health'));
+    return { reply: help };
   }
 }
 
@@ -264,18 +300,12 @@ chatInput.addEventListener("keypress", e => {
     addMessage("user", msg);
     chatInput.value = "";
 
-    // Start thinking visually
     startThinking();
 
-    // Call backend but do not block main thread — handle reply in .then()
-    // This ensures the render loop keeps running immediately.
     sendToBackend(msg).then(result => {
-      // Guarantee min thinking time before stopping
       stopThinking();
-      // Show AI message (same feeling as before)
       addMessage("ai", result.reply);
 
-      // If backend returned a resume URL, add a download link under the AI message
       if (result.resume_url) {
         const a = document.createElement("a");
         a.href = result.resume_url;
@@ -283,7 +313,6 @@ chatInput.addEventListener("keypress", e => {
         a.rel = "noopener noreferrer";
         a.textContent = "Download resume";
         a.classList.add("resume-link");
-        // attach small stub message so it scrolls into view
         const div = document.createElement("div");
         div.classList.add("message", "ai", "resume");
         div.appendChild(a);
@@ -311,7 +340,6 @@ function addMessage(sender, text) {
    ----------------------- */
 
 function createSettingsUI() {
-  // container
   const container = document.createElement('div');
   container.id = 'ultron-settings';
   container.style.position = 'fixed';
@@ -321,7 +349,6 @@ function createSettingsUI() {
   container.style.fontFamily = 'system-ui,Arial, sans-serif';
   document.body.appendChild(container);
 
-  // gear button
   const btn = document.createElement('button');
   btn.title = 'Ultron settings';
   btn.style.width = '48px';
@@ -339,7 +366,6 @@ function createSettingsUI() {
   btn.innerHTML = '⚙';
   container.appendChild(btn);
 
-  // panel (hidden initially)
   const panel = document.createElement('div');
   panel.style.minWidth = '320px';
   panel.style.maxWidth = '420px';
@@ -357,13 +383,11 @@ function createSettingsUI() {
   panel.style.boxSizing = 'border-box';
   container.appendChild(panel);
 
-  // title
   const title = document.createElement('div');
   title.textContent = 'Ultron — Settings';
   title.style.fontWeight = '600';
   panel.appendChild(title);
 
-  // backend url input
   const backendLabel = document.createElement('label');
   backendLabel.textContent = 'Backend URL';
   backendLabel.style.fontSize = '12px';
@@ -372,14 +396,13 @@ function createSettingsUI() {
   const backendInput = document.createElement('input');
   backendInput.type = 'text';
   backendInput.value = BACKEND_URL || '';
-  backendInput.placeholder = 'https://localhost:5000/api/chat';
+  backendInput.placeholder = 'https://localhost:5001/api/chat';
   backendInput.style.width = '100%';
   backendInput.style.padding = '8px';
   backendInput.style.borderRadius = '6px';
   backendInput.style.border = '1px solid rgba(0,0,0,0.08)';
   panel.appendChild(backendInput);
 
-  // api key input
   const apiLabel = document.createElement('label');
   apiLabel.textContent = 'Client API Key';
   apiLabel.style.fontSize = '12px';
@@ -395,7 +418,6 @@ function createSettingsUI() {
   apiInput.style.border = '1px solid rgba(0,0,0,0.08)';
   panel.appendChild(apiInput);
 
-  // buttons row
   const row = document.createElement('div');
   row.style.display = 'flex';
   row.style.gap = '8px';
@@ -434,14 +456,12 @@ function createSettingsUI() {
   closeBtn.style.color = '#fff';
   row.appendChild(closeBtn);
 
-  // small helper text
   const hint = document.createElement('div');
   hint.style.fontSize = '12px';
   hint.style.color = '#6b7280';
   hint.textContent = 'You can also set backend & key via URL query parameters or console.';
   panel.appendChild(hint);
 
-  // events
   btn.addEventListener('click', () => {
     panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
   });
@@ -469,7 +489,6 @@ function createSettingsUI() {
       localStorage.removeItem('ULTRON_API_KEY');
       API_KEY = DEFAULT_API_KEY;
     }
-    // visual feedback: briefly change button
     saveBtn.textContent = 'Saved ✓';
     setTimeout(() => (saveBtn.textContent = 'Save'), 1200);
   });
@@ -486,7 +505,6 @@ function createSettingsUI() {
     setTimeout(() => (resetBtn.textContent = 'Reset'), 900);
   });
 
-  // prefill inputs from storage (in case changed after script load)
   backendInput.value = localStorage.getItem('ULTRON_BACKEND') || BACKEND_URL || '';
   apiInput.value = localStorage.getItem('ULTRON_API_KEY') || API_KEY || '';
 }
