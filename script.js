@@ -1,6 +1,9 @@
-/* updated script.js - mandala thinking reliably visible + backend call
-   Connectivity patch: dynamic backend/key via query/localStorage + settings UI.
-   sendToBackend attempts protocol fallback and outputs helpful diagnostics.
+/* script.js — updated connectivity-only patch
+   - All mandala / particle / chat functionality kept identical.
+   - Enhanced backend connectivity logic:
+     * auto-upgrade http:// -> https:// when page is https
+     * probe /health and show an unobtrusive status banner with tips
+     * settings UI to change backend & api key (saved to localStorage)
 */
 
 const canvas = document.getElementById('aiBall');
@@ -17,8 +20,10 @@ let mandalaProgress = 0;
 const rings = 6;
 
 // === CONNECTIVITY CONFIG (now dynamic) ===
-// Default - replace or override via query params or settings UI
-let DEFAULT_BACKEND_URL = "http://localhost:5001/api/chat";
+// Default (safe local dev default). Override via:
+//  1) URL query: ?backend=<BACKEND_URL>&apikey=<API_KEY>
+//  2) localStorage keys: ULTRON_BACKEND and ULTRON_API_KEY
+let DEFAULT_BACKEND_URL = "http://127.0.0.1:5001/api/chat";
 let DEFAULT_API_KEY = "ULTRON_CLIENT_KEY_ABC";
 
 // helper: read query params
@@ -35,23 +40,56 @@ const q = getQueryParams();
 let BACKEND_URL = q.backend || localStorage.getItem('ULTRON_BACKEND') || DEFAULT_BACKEND_URL;
 let API_KEY = q.apikey || localStorage.getItem('ULTRON_API_KEY') || DEFAULT_API_KEY;
 
-// helper: compute backend origin (for resolving relative resume_url)
+// helper to compute origin (for resolving resume_url)
 function backendOriginFrom(url) {
   try {
     const u = new URL(url);
     return u.origin;
   } catch (e) {
-    // if url is relative or invalid, fall back to current origin
     return window.location.origin;
   }
 }
 let BACKEND_ORIGIN = backendOriginFrom(BACKEND_URL);
 
-// Chat elements
-const chatMessages = document.getElementById("chatMessages");
-const chatInput = document.getElementById("chatInput");
+// small UI banner to show connection status & tips
+function ensureStatusBanner() {
+  if (document.getElementById('ultron-conn-banner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'ultron-conn-banner';
+  banner.style.position = 'fixed';
+  banner.style.left = '50%';
+  banner.style.transform = 'translateX(-50%)';
+  banner.style.bottom = '84px';
+  banner.style.zIndex = 9998;
+  banner.style.padding = '8px 12px';
+  banner.style.borderRadius = '10px';
+  banner.style.boxShadow = '0 10px 30px rgba(0,0,0,0.12)';
+  banner.style.background = '#fff7ed';
+  banner.style.color = '#92400e';
+  banner.style.fontSize = '13px';
+  banner.style.display = 'none';
+  banner.style.maxWidth = 'min(88%,720px)';
+  banner.style.textAlign = 'left';
+  banner.style.lineHeight = '1.25';
+  banner.style.border = '1px solid rgba(0,0,0,0.04)';
+  banner.style.fontFamily = 'system-ui, Arial, sans-serif';
+  document.body.appendChild(banner);
+}
+function showStatusBanner(html, timeoutMs = 0) {
+  ensureStatusBanner();
+  const banner = document.getElementById('ultron-conn-banner');
+  banner.innerHTML = html;
+  banner.style.display = 'block';
+  if (timeoutMs > 0) {
+    setTimeout(() => { banner.style.display = 'none'; }, timeoutMs);
+  }
+}
+function hideStatusBanner() {
+  const banner = document.getElementById('ultron-conn-banner');
+  if (banner) banner.style.display = 'none';
+}
 
-// Linear interpolation
+// Linear interpolation & easing
 function lerp(a, b, t) { return a + (b - a) * t; }
 function easeInOut(t) { return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; }
 
@@ -217,8 +255,112 @@ function animate(time) {
   requestAnimationFrame(animate);
 }
 
+// === CONNECTIVITY HELPERS ===
+
+// health endpoint derived from BACKEND_URL
+function healthUrlForBackend(url) {
+  try {
+    const u = new URL(url);
+    // replace path with /health
+    u.pathname = '/health';
+    u.search = '';
+    u.hash = '';
+    return u.toString();
+  } catch (e) {
+    // fallback: try base origin + /health
+    return (backendOriginFrom(url) + '/health');
+  }
+}
+
+// probe backend /health and return {ok:boolean, json?, status:number, error?:string}
+async function probeBackend(url, timeout = 3000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const res = await fetch(healthUrlForBackend(url), { method: 'GET', mode: 'cors', signal: controller.signal });
+    clearTimeout(id);
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      return { ok: false, status: res.status, error: txt || `status ${res.status}` };
+    }
+    const json = await res.json().catch(() => null);
+    return { ok: true, status: res.status, json };
+  } catch (err) {
+    clearTimeout(id);
+    // Distinguish common causes
+    if (err.name === 'AbortError') return { ok: false, error: 'timeout' };
+    return { ok: false, error: err.message || String(err) };
+  }
+}
+
+// Upgrade http -> https when page is secure to avoid mixed-content
+async function tryAutoUpgradeIfNeeded() {
+  // only when page served over https and backend is http
+  if (window.location.protocol === 'https:' && BACKEND_URL.startsWith('http://')) {
+    const httpsCandidate = BACKEND_URL.replace(/^http:\/\//i, 'https://');
+    // probe httpsCandidate
+    const probe = await probeBackend(httpsCandidate, 2500);
+    if (probe.ok) {
+      BACKEND_URL = httpsCandidate;
+      BACKEND_ORIGIN = backendOriginFrom(BACKEND_URL);
+      localStorage.setItem('ULTRON_BACKEND', BACKEND_URL);
+      showStatusBanner('Connected: upgraded backend to <code>https://</code>.', 3000);
+      return true;
+    } else {
+      // if probe failed, likely blocked by mixed-content or cert issue — show banner with tips
+      let tipHtml = `<strong>Backend unreachable from this HTTPS page.</strong> Browser may block HTTP backend (mixed-content).<br>`;
+      tipHtml += `Try one of these: <ul style="margin:6px 0 4px 18px;padding:0">`;
+      tipHtml += `<li>Set backend to an <code>https://</code> URL (e.g. <code>https://192.168.0.105:5001/api/chat</code>) and accept the certificate at its <a href="${healthUrlForBackend(BACKEND_URL)}" target="_blank" rel="noopener noreferrer">/health</a>.</li>`;
+      tipHtml += `<li>Or test locally by serving the frontend on your laptop and using <code>http://127.0.0.1:5001/api/chat</code>.</li></ul>`;
+      tipHtml += `Open the settings (⚙) to change the backend URL.`;
+      showStatusBanner(tipHtml);
+      return false;
+    }
+  }
+  return true;
+}
+
+// Call this whenever settings change or on load
+async function verifyBackendAndUpdateUI() {
+  hideStatusBanner();
+  BACKEND_ORIGIN = backendOriginFrom(BACKEND_URL);
+  // try auto-upgrade if needed
+  await tryAutoUpgradeIfNeeded();
+
+  // probe actual BACKEND_URL
+  const probe = await probeBackend(BACKEND_URL, 2500);
+  if (probe.ok) {
+    // good
+    hideStatusBanner();
+    return true;
+  } else {
+    // If we are on an HTTPS page and backend is HTTP, we know browser will block — show targeted banner
+    if (window.location.protocol === 'https:' && BACKEND_URL.startsWith('http://')) {
+      const tipHtml = `<strong>Mixed-content detected:</strong> This page is HTTPS but your backend is HTTP.<br>` +
+        `Change backend to <code>https://...:5001/api/chat</code> (use your laptop IP) and accept the certificate at its <a href="${healthUrlForBackend(BACKEND_URL)}" target="_blank" rel="noopener noreferrer">/health</a>.`;
+      showStatusBanner(tipHtml);
+      return false;
+    }
+
+    // otherwise show generic unreachable banner with diagnostic
+    let details = probe.error || `status ${probe.status || 'n/a'}`;
+    const tipHtml = `<strong>Ultron backend unreachable:</strong> ${escapeHtml(details)}.<br>` +
+      `Check server is running and backend URL is correct. Health: <code>${escapeHtml(healthUrlForBackend(BACKEND_URL))}</code>.<br>` +
+      `Open settings (⚙) to edit backend & API key.`;
+    showStatusBanner(tipHtml);
+    return false;
+  }
+}
+
+// small helper to escape HTML for banner
+function escapeHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/[&<>"']/g, function (m) {
+    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[m];
+  });
+}
+
 // === CHAT / BACKEND ===
-// Robust sendToBackend with fallback & diagnostics
 async function sendToBackend(msg) {
   async function postTo(url) {
     const res = await fetch(url, {
@@ -240,7 +382,7 @@ async function sendToBackend(msg) {
     return res.json();
   }
 
-  // Try configured URL
+  // Try current BACKEND_URL first
   try {
     const data = await postTo(BACKEND_URL);
     const replyText = data.reply || data.text || "Ultron: (no response)";
@@ -252,47 +394,53 @@ async function sendToBackend(msg) {
   } catch (err) {
     console.warn("Primary backend request failed:", err);
 
-    try {
-      const pageIsHttps = window.location.protocol === "https:";
-      const backendIsHttp = BACKEND_URL.startsWith("http://");
-      if (pageIsHttps && backendIsHttp) {
-        const httpsUrl = BACKEND_URL.replace(/^http:\/\//i, "https://");
-        try {
-          const data = await postTo(httpsUrl);
-          BACKEND_URL = httpsUrl;
-          localStorage.setItem('ULTRON_BACKEND', BACKEND_URL);
-          BACKEND_ORIGIN = backendOriginFrom(BACKEND_URL);
-          const replyText = data.reply || data.text || "Ultron: (no response)";
-          let resumeFullUrl = null;
-          if (data.resume_url) {
-            try { resumeFullUrl = new URL(data.resume_url, BACKEND_ORIGIN).toString(); } catch (e) { resumeFullUrl = data.resume_url; }
-          }
-          return { reply: replyText, resume_url: resumeFullUrl };
-        } catch (err2) {
-          console.warn("HTTPS fallback failed:", err2);
+    // If page is HTTPS and backend was HTTP, try https upgrade automatically
+    if (window.location.protocol === 'https:' && BACKEND_URL.startsWith('http://')) {
+      const httpsCandidate = BACKEND_URL.replace(/^http:\/\//i, 'https://');
+      try {
+        const data = await postTo(httpsCandidate);
+        // success: persist new url
+        BACKEND_URL = httpsCandidate;
+        BACKEND_ORIGIN = backendOriginFrom(BACKEND_URL);
+        localStorage.setItem('ULTRON_BACKEND', BACKEND_URL);
+        showStatusBanner('Connected: upgraded backend to <code>https://</code>.', 2200);
+        const replyText = data.reply || data.text || "Ultron: (no response)";
+        let resumeFullUrl = null;
+        if (data.resume_url) {
+          try { resumeFullUrl = new URL(data.resume_url, BACKEND_ORIGIN).toString(); } catch (e) { resumeFullUrl = data.resume_url; }
         }
+        return { reply: replyText, resume_url: resumeFullUrl };
+      } catch (err2) {
+        console.warn("HTTPS fallback failed:", err2);
+        // show mixed-content advice
+        const health = healthUrlForBackend(BACKEND_URL);
+        let help = "Ultron: Unable to reach backend.";
+        if (window.location.protocol === "https:" && BACKEND_URL.startsWith("http://")) {
+          help += " (Blocked by browser: this page is HTTPS but backend is HTTP — mixed-content.)";
+          help += ` Tip: set backend to an <code>https://</code> URL (e.g. <code>https://192.168.0.105:5001/api/chat</code>) and accept the certificate at <a href="${health}" target="_blank" rel="noopener noreferrer">/health</a>.`;
+        } else {
+          help += " (See console for details.)";
+        }
+        showStatusBanner(help);
+        return { reply: help };
       }
-    } catch (e) {
-      // ignore
     }
 
+    // Generic fallback message with helpful tips
     let help = "Ultron: Unable to reach backend.";
-    if (window.location.protocol === "https:" && BACKEND_URL.startsWith("http://")) {
-      help += " (Blocked by browser: page is HTTPS but backend URL is HTTP — mixed-content.)";
-      help += " Tip: set backend to an HTTPS URL for your laptop (e.g. https://192.168.0.105:5001/api/chat) and ensure the laptop TLS cert is trusted.";
-    } else if (err && (err.message && (err.message.includes("NetworkError") || err.message.includes("Failed to fetch")))) {
-      help += " (Network error — backend unreachable).";
-      help += " Tip: Verify server is running and address/port are correct. Try terminal: curl -v " + (BACKEND_URL.replace('/api/chat','/health'));
-    } else if (err && err.message && err.message.toLowerCase().includes("server error")) {
-      help += " (" + err.message + ")";
+    if (err && err.message && err.message.toLowerCase().includes("server error")) {
+      help += " (" + escapeHtml(err.message) + ")";
     } else {
-      help += " (See console for details.)";
+      help += " (Check server, URL & API key).";
     }
-
-    help += " To trust a local TLS cert visit the backend health URL in this browser: " + (BACKEND_URL.replace('/api/chat','/health'));
+    showStatusBanner(help);
     return { reply: help };
   }
 }
+
+// chat input handling
+const chatMessages = document.getElementById("chatMessages");
+const chatInput = document.getElementById("chatInput");
 
 chatInput.addEventListener("keypress", e => {
   if (e.key === "Enter" && chatInput.value.trim() !== "") {
@@ -340,6 +488,7 @@ function addMessage(sender, text) {
    ----------------------- */
 
 function createSettingsUI() {
+  // container
   const container = document.createElement('div');
   container.id = 'ultron-settings';
   container.style.position = 'fixed';
@@ -349,6 +498,7 @@ function createSettingsUI() {
   container.style.fontFamily = 'system-ui,Arial, sans-serif';
   document.body.appendChild(container);
 
+  // gear button
   const btn = document.createElement('button');
   btn.title = 'Ultron settings';
   btn.style.width = '48px';
@@ -366,9 +516,10 @@ function createSettingsUI() {
   btn.innerHTML = '⚙';
   container.appendChild(btn);
 
+  // panel (hidden initially)
   const panel = document.createElement('div');
   panel.style.minWidth = '320px';
-  panel.style.maxWidth = '420px';
+  panel.style.maxWidth = '520px';
   panel.style.padding = '12px';
   panel.style.borderRadius = '10px';
   panel.style.boxShadow = '0 10px 30px rgba(0,0,0,0.15)';
@@ -383,11 +534,13 @@ function createSettingsUI() {
   panel.style.boxSizing = 'border-box';
   container.appendChild(panel);
 
+  // title
   const title = document.createElement('div');
   title.textContent = 'Ultron — Settings';
   title.style.fontWeight = '600';
   panel.appendChild(title);
 
+  // backend url input
   const backendLabel = document.createElement('label');
   backendLabel.textContent = 'Backend URL';
   backendLabel.style.fontSize = '12px';
@@ -396,13 +549,14 @@ function createSettingsUI() {
   const backendInput = document.createElement('input');
   backendInput.type = 'text';
   backendInput.value = BACKEND_URL || '';
-  backendInput.placeholder = 'https://localhost:5001/api/chat';
+  backendInput.placeholder = 'https://192.168.0.105:5001/api/chat';
   backendInput.style.width = '100%';
   backendInput.style.padding = '8px';
   backendInput.style.borderRadius = '6px';
   backendInput.style.border = '1px solid rgba(0,0,0,0.08)';
   panel.appendChild(backendInput);
 
+  // api key input
   const apiLabel = document.createElement('label');
   apiLabel.textContent = 'Client API Key';
   apiLabel.style.fontSize = '12px';
@@ -418,6 +572,7 @@ function createSettingsUI() {
   apiInput.style.border = '1px solid rgba(0,0,0,0.08)';
   panel.appendChild(apiInput);
 
+  // buttons row
   const row = document.createElement('div');
   row.style.display = 'flex';
   row.style.gap = '8px';
@@ -456,12 +611,14 @@ function createSettingsUI() {
   closeBtn.style.color = '#fff';
   row.appendChild(closeBtn);
 
+  // small helper text
   const hint = document.createElement('div');
   hint.style.fontSize = '12px';
   hint.style.color = '#6b7280';
   hint.textContent = 'You can also set backend & key via URL query parameters or console.';
   panel.appendChild(hint);
 
+  // events
   btn.addEventListener('click', () => {
     panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
   });
@@ -470,7 +627,7 @@ function createSettingsUI() {
     panel.style.display = 'none';
   });
 
-  saveBtn.addEventListener('click', () => {
+  saveBtn.addEventListener('click', async () => {
     const newBackend = backendInput.value.trim();
     const newKey = apiInput.value.trim();
     if (newBackend) {
@@ -489,11 +646,18 @@ function createSettingsUI() {
       localStorage.removeItem('ULTRON_API_KEY');
       API_KEY = DEFAULT_API_KEY;
     }
-    saveBtn.textContent = 'Saved ✓';
-    setTimeout(() => (saveBtn.textContent = 'Save'), 1200);
+
+    // verify new settings and inform user
+    const ok = await verifyBackendAndUpdateUI();
+    if (ok) {
+      saveBtn.textContent = 'Saved ✓';
+    } else {
+      saveBtn.textContent = 'Saved (unreachable)';
+    }
+    setTimeout(() => (saveBtn.textContent = 'Save'), 1400);
   });
 
-  resetBtn.addEventListener('click', () => {
+  resetBtn.addEventListener('click', async () => {
     localStorage.removeItem('ULTRON_BACKEND');
     localStorage.removeItem('ULTRON_API_KEY');
     backendInput.value = DEFAULT_BACKEND_URL;
@@ -501,10 +665,12 @@ function createSettingsUI() {
     BACKEND_URL = DEFAULT_BACKEND_URL;
     API_KEY = DEFAULT_API_KEY;
     BACKEND_ORIGIN = backendOriginFrom(BACKEND_URL);
-    resetBtn.textContent = 'Reset ✓';
+    const ok = await verifyBackendAndUpdateUI();
+    resetBtn.textContent = ok ? 'Reset ✓' : 'Reset (unreachable)';
     setTimeout(() => (resetBtn.textContent = 'Reset'), 900);
   });
 
+  // prefill inputs from storage (in case changed after script load)
   backendInput.value = localStorage.getItem('ULTRON_BACKEND') || BACKEND_URL || '';
   apiInput.value = localStorage.getItem('ULTRON_API_KEY') || API_KEY || '';
 }
@@ -517,3 +683,10 @@ window.addEventListener('resize', resizeCanvas);
 
 // create settings ui after mount
 createSettingsUI();
+
+// Do a connectivity check on load (but don't spam)
+setTimeout(() => {
+  verifyBackendAndUpdateUI().catch((e) => {
+    console.warn("verifyBackendAndUpdateUI failed:", e);
+  });
+}, 400);
