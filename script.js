@@ -1,4 +1,7 @@
-/* updated script.js - mandala thinking reliably visible + backend call */
+/* updated script.js - mandala thinking reliably visible + backend call
+   Connectivity patch: query/localStorage backend + API key, resume link handling.
+   (Everything else unchanged.)
+*/
 
 const canvas = document.getElementById('aiBall');
 const ctx = canvas.getContext('2d');
@@ -13,12 +16,38 @@ let mandalaRotation = 0;
 let mandalaProgress = 0;
 const rings = 6;
 
-// === NEW CONFIG ===
-const BACKEND_URL = "https://shanta-unreared-richie.ngrok-free.dev/api/chat";
+// === CONNECTIVITY CONFIG (now dynamic) ===
+// Default (kept for backwards compatibility). You can override via:
+// 1) URL query: ?backend=<BACKEND_URL>&apikey=<API_KEY>
+// 2) localStorage keys: ULTRON_BACKEND and ULTRON_API_KEY
+let DEFAULT_BACKEND_URL = "https://shanta-unreared-richie.ngrok-free.dev/api/chat";
+let DEFAULT_API_KEY = "ULTRON_TEST_KEY_123";
 
-const API_KEY = "ULTRON_TEST_KEY_123";
+// helper: read query params
+function getQueryParams() {
+  try {
+    const search = window.location.search.substring(1);
+    return Object.fromEntries(new URLSearchParams(search));
+  } catch (e) {
+    return {};
+  }
+}
 
+const q = getQueryParams();
+const BACKEND_URL = q.backend || localStorage.getItem('ULTRON_BACKEND') || DEFAULT_BACKEND_URL;
+const API_KEY = q.apikey || localStorage.getItem('ULTRON_API_KEY') || DEFAULT_API_KEY;
 
+// helper: compute backend origin (for resolving relative resume_url)
+function backendOriginFrom(url) {
+  try {
+    const u = new URL(url);
+    return u.origin;
+  } catch (e) {
+    // if url is relative or invalid, fall back to current origin
+    return window.location.origin;
+  }
+}
+const BACKEND_ORIGIN = backendOriginFrom(BACKEND_URL);
 
 // Chat elements
 const chatMessages = document.getElementById("chatMessages");
@@ -199,21 +228,32 @@ async function sendToBackend(msg) {
     const res = await fetch(BACKEND_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: msg, apiKey: API_KEY })
+      body: JSON.stringify({ message: msg, apiKey: API_KEY, clientId: navigator.userAgent })
     });
     if (!res.ok) {
       // try to parse error body
       let errBody = "";
       try { errBody = await res.text(); } catch (_) {}
       console.error("Server error:", res.status, errBody);
-      return `Ultron: (backend error ${res.status})`;
+      return { reply: `Ultron: (backend error ${res.status})` };
     }
     const data = await res.json();
-    // some dummy backends return { reply } or { text } — normalize both
-    return data.reply || data.text || "Ultron: (no response)";
+    // data may be { reply } or { text } and may include resume_url
+    const replyText = data.reply || data.text || "Ultron: (no response)";
+    // normalize resume url: if backend returns "resume_url" relative, convert to absolute
+    let resumeFullUrl = null;
+    if (data.resume_url) {
+      try {
+        // if resume_url is absolute, new URL will parse it. If relative, base it on backend origin.
+        resumeFullUrl = new URL(data.resume_url, BACKEND_ORIGIN).toString();
+      } catch (e) {
+        resumeFullUrl = data.resume_url;
+      }
+    }
+    return { reply: replyText, resume_url: resumeFullUrl };
   } catch (e) {
     console.error("Backend fetch failed:", e);
-    return "Ultron: Unable to reach backend.";
+    return { reply: "Ultron: Unable to reach backend." };
   }
 }
 
@@ -228,12 +268,27 @@ chatInput.addEventListener("keypress", e => {
 
     // Call backend but do not block main thread — handle reply in .then()
     // This ensures the render loop keeps running immediately.
-    sendToBackend(msg).then(reply => {
+    sendToBackend(msg).then(result => {
       // Guarantee min thinking time before stopping
       stopThinking();
-      // When stopThinking sets aiThinking false after MIN_THINK_MS, we still
-      // want to add the AI message immediately upon receiving reply so chat doesn't feel slow.
-      addMessage("ai", reply);
+      // Show AI message (same feeling as before)
+      addMessage("ai", result.reply);
+
+      // If backend returned a resume URL, add a download link under the AI message
+      if (result.resume_url) {
+        const a = document.createElement("a");
+        a.href = result.resume_url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = "Download resume";
+        a.classList.add("resume-link");
+        // attach small stub message so it scrolls into view
+        const div = document.createElement("div");
+        div.classList.add("message", "ai", "resume");
+        div.appendChild(a);
+        chatMessages.appendChild(div);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+      }
     }).catch(err => {
       stopThinking();
       addMessage("ai", "Ultron: Something went wrong.");
